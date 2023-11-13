@@ -114,6 +114,7 @@ pkg_script_run(struct pkg * const pkg, pkg_script type, bool upgrade)
 			if (ctx.pkg_rootdir == NULL)
 				ctx.pkg_rootdir = "/";
 			setenv("PKG_ROOTDIR", ctx.pkg_rootdir, 1);
+			setenv("PKG_ISCHROOTED", (ctx.ischrooted ? "true" : "false"), 1);
 			debug = pkg_object_bool(pkg_config_get("DEBUG_SCRIPTS"));
 			if (debug)
 				fprintf(script_cmd->fp, "set -x\n");
