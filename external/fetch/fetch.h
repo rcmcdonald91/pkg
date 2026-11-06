@@ -36,6 +36,8 @@
 #define URL_SCHEMELEN 16
 #define URL_USERLEN 256
 #define URL_PWDLEN 256
+/* Longer validators are ignored, never truncated and reused. */
+#define FETCH_VALIDATOR_SIZE 256
 
 struct url {
 	char		 scheme[URL_SCHEMELEN+1];
@@ -48,12 +50,14 @@ struct url {
 	size_t		 length;
 	time_t		 ims_time;
 	int		 netrcfd;
+	const char	*if_range;	/* borrowed conditional range validator */
 };
 
 struct url_stat {
 	off_t		 size;
 	time_t		 atime;
 	time_t		 mtime;
+	char		 validator[FETCH_VALIDATOR_SIZE];
 };
 
 struct url_ent {
@@ -87,6 +91,7 @@ struct url_ent {
 #define	FETCH_UNKNOWN	17
 #define	FETCH_URL	18
 #define	FETCH_VERBOSE	19
+#define	FETCH_RESTART	20	/* conditional range requires a full GET */
 
 #ifdef __cplusplus
 extern "C" {

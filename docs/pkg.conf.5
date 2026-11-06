@@ -231,6 +231,26 @@ waiting cannot change that.
 For a plain repository (a single server), each pass is one attempt.
 Set to 0 to make only the initial attempt, without retries or mirror
 failover; negative values are treated as 0.
+.Pp
+Over HTTP and HTTPS, a transfer interrupted once it has started, by a
+network error, a stall caught by
+.Cm FETCH_TIMEOUT
+or a detected early end of the response, is retried automatically when
+the destination is a regular file.
+Here
+.Cm FETCH_RETRY
+bounds the total number of recovery passes after the initial transfer.
+Each recovery pass tries the mirror list once; failed reconnections and
+full restarts consume this budget, even when earlier attempts made progress.
+Range requests use
+.Cm If-Range
+with a strong ETag, or a Last-Modified date at least 60 seconds older than
+its response's Date header.
+Without a usable validator, recovery restarts from the beginning.
+Partial files from an earlier invocation are also restarted because their
+HTTP validators are not retained.
+A changed file or an unsupported range also causes a full restart.
+Set to 0 to disable recovery of interrupted transfers.
 Default: 5.
 .It Cm FETCH_RETRY_DELAY: integer
 Number of seconds to wait before retrying a failed fetch, so that a
@@ -242,6 +262,10 @@ Moving on to the next server within a pass is not delayed.
 With the defaults, five failed passes incur waits of 1, 2, 4 and 8
 seconds (15 seconds total), regardless of the number of mirrors.
 Connection and transfer timeouts are additional to these waits.
+For interrupted transfers, the delay increases with each recovery pass.
+With the defaults, up to five recovery passes wait 1, 2, 4, 8 and 16
+seconds (31 seconds total), in addition to any waits while opening the
+initial transfer.
 Set to 0 to retry immediately; negative values are treated as 0.
 Default: 1.
 .It Cm FETCH_TIMEOUT: integer

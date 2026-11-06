@@ -28,6 +28,7 @@
 #include <sys/param.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 
 #include <ctype.h>
@@ -38,6 +39,7 @@
 #include <fetch.h>
 #include <paths.h>
 #include <poll.h>
+#include <unistd.h>
 
 #include <bsd_compat.h>
 
@@ -185,7 +187,7 @@ libfetch_permanent(void)
 
 static int
 libfetch_open_retry(struct pkg_repo *repo, struct fetch_item *fi,
-    int64_t max_retry)
+    int64_t max_retry, bool recovery)
 {
 	struct url *u;
 	struct url *repourl;
@@ -231,6 +233,8 @@ libfetch_open_retry(struct pkg_repo *repo, struct fetch_item *fi,
 
 	ims = fi->mtime;
 	u->ims_time = ims;
+	if (recovery && fi->http_validator[0] != '\0')
+		u->if_range = fi->http_validator;
 	if (fi->offset > 0)
 		u->offset = fi->offset;
 
@@ -316,6 +320,9 @@ libfetch_open_retry(struct pkg_repo *repo, struct fetch_item *fi,
 			u->port = http_current->url->port;
 		}
 		sb_cat(&fetchOpts, "i");
+		/* Discard abandoned recovery bodies instead of draining them. */
+		if (recovery)
+			sb_cat(&fetchOpts, "c");
 		if (repo->ip == IPV4)
 			sb_cat(&fetchOpts, "4");
 		else if (repo->ip == IPV6)
@@ -337,11 +344,16 @@ libfetch_open_retry(struct pkg_repo *repo, struct fetch_item *fi,
 		repo->fh = fetchXGet(u, &st, opts);
 		free(opts);
 		if (repo->fh == NULL) {
+			if (fetchLastErrCode == FETCH_RESTART) {
+				retcode = EPKG_AGAIN;
+				goto out;
+			}
 			if (fetchLastErrCode == FETCH_OK) {
 				retcode = EPKG_UPTODATE;
 				goto out;
 			}
-			if (fetchLastErrCode == FETCH_ABORT) {
+			/* During recovery a connection reset is another failed open. */
+			if (fetchLastErrCode == FETCH_ABORT && !recovery) {
 				retcode = EPKG_CANCEL;
 				goto out;
 			}
@@ -424,6 +436,9 @@ libfetch_open_retry(struct pkg_repo *repo, struct fetch_item *fi,
 	}
 	fi->size = st.size > 0 ? st.size : 0;
 	fi->mtime = st.mtime;
+	/* A server ignoring the range request starts over at 0. */
+	fi->offset = u->offset;
+	strlcpy(fi->http_validator, st.validator, sizeof(fi->http_validator));
 	retcode = EPKG_OK;
 out:
 	/*
@@ -441,22 +456,136 @@ out:
 int
 libfetch_open(struct pkg_repo *repo, struct fetch_item *fi)
 {
+	/* No validator is stored with partial files from an earlier fetch. */
+	fi->http_validator[0] = '\0';
+	if (fi->offset > 0) {
+		fi->offset = 0;
+		fi->mtime = 0;
+	}
 	return (libfetch_open_retry(repo, fi,
-	    pkg_object_int(pkg_config_get("FETCH_RETRY"))));
+	    pkg_object_int(pkg_config_get("FETCH_RETRY")), false));
 }
 
+/*
+ * Make dest hold exactly the first offset bytes of the file, positioned at
+ * their end.  It already does unless the server ignored a range request and
+ * started over, in which case the bytes past offset are dropped.
+ */
+static int
+libfetch_seek(int dest, off_t offset)
+{
+	struct stat st;
+
+	if (fstat(dest, &st) == -1) {
+		pkg_emit_errno("fstat", "fetch destination");
+		return (EPKG_FATAL);
+	}
+	if (st.st_size < offset) {
+		pkg_emit_error("cannot resume the transfer: the destination "
+		    "holds %jd bytes, not %jd", (intmax_t)st.st_size,
+		    (intmax_t)offset);
+		return (EPKG_FATAL);
+	}
+	if (st.st_size > offset && ftruncate(dest, offset) == -1) {
+		pkg_emit_errno("ftruncate", "fetch destination");
+		return (EPKG_FATAL);
+	}
+	if (lseek(dest, offset, SEEK_SET) == -1) {
+		pkg_emit_errno("lseek", "fetch destination");
+		return (EPKG_FATAL);
+	}
+	return (EPKG_OK);
+}
+
+/*
+ * Reconnect once through the mirrors. Only reuse bytes when an HTTP
+ * validator identifies the original representation. EPKG_AGAIN requests
+ * a full restart on the next budgeted attempt (e.g. after HTTP 416).
+ */
+static int
+libfetch_reopen(struct pkg_repo *repo, struct fetch_item *fi, off_t *offset)
+{
+	off_t size = fi->size;
+	time_t mtime = fi->mtime;
+	int ret;
+
+	fh_close(repo);
+	/* A body cut short by EOF can leave a dead connection in the cache. */
+	http_cache_flush();
+	if (fi->http_validator[0] == '\0')
+		*offset = 0;
+	fi->offset = *offset;
+	/* If-Modified-Since would allow a bodyless 304 during recovery. */
+	fi->mtime = 0;
+	ret = libfetch_open_retry(repo, fi, 1, true);
+	if (ret != EPKG_OK || (fi->offset > 0 && fi->mtime == 0))
+		fi->mtime = mtime;
+	if (ret == EPKG_OK && fi->offset > 0 && size > 0 &&
+	    fi->size != size) {
+		fh_close(repo);
+		ret = EPKG_AGAIN;
+	}
+	if (ret == EPKG_AGAIN) {
+		*offset = 0;
+		fi->http_validator[0] = '\0';
+	}
+	return (ret == EPKG_UPTODATE ? EPKG_FATAL : ret);
+}
+
+/*
+ * Recover interrupted transfers to regular files. FETCH_RETRY bounds the
+ * total reconnection passes, including full restarts and failed opens;
+ * progress never replenishes this budget. Each pass has its own backoff
+ * but no nested connection retries.
+ */
 int
 libfetch_fetch(struct pkg_repo *repo, int dest, struct fetch_item *fi)
 {
-	int ret;
+	struct stat st;
+	int64_t max_retry, retry = 0;
+	off_t reached = 0;
+	int err = 0, ret;
+	bool resuming = false;
 
-	ret = stdio_fetch(repo, dest, fi);
+	/* Resuming needs a destination that can be truncated and seeked. */
+	if (fstat(dest, &st) == -1 || !S_ISREG(st.st_mode))
+		return (stdio_fetch(repo, dest, fi));
 
-	if (ret == EPKG_OK && ferror(repo->fh)) {
-		pkg_emit_error("%s: %s", fi->url, fetchLastErrString);
-		return (EPKG_FATAL);
+	max_retry = pkg_object_int(pkg_config_get("FETCH_RETRY"));
+	for (;;) {
+		if (resuming) {
+			if (retry >= max_retry) {
+				fetch_emit_interrupted(fi, reached, err);
+				return (EPKG_FATAL);
+			}
+			fetch_retry_wait(++retry);
+			ret = libfetch_reopen(repo, fi, &reached);
+			/* Classify failed reopens like the open loop does. */
+			if (ret == EPKG_AGAIN ||
+			    (ret == EPKG_FATAL && !libfetch_permanent()))
+				continue;
+			if (ret != EPKG_OK)
+				return (ret);
+		}
+
+		if ((ret = libfetch_seek(dest, fi->offset)) != EPKG_OK)
+			return (ret);
+		ret = stdio_fetch_part(repo, dest, fi, resuming, &reached,
+		    &err);
+		if (ret != EPKG_AGAIN)
+			return (ret);
+		if (retry >= max_retry ||
+		    (fi->size > 0 && reached >= fi->size) ||
+		    (fi->expected_size > 0 && reached >= fi->expected_size)) {
+			fetch_emit_interrupted(fi, reached, err);
+			return (EPKG_FATAL);
+		}
+		pkg_emit_notice("%s: interrupted after %jd bytes (%s), "
+		    "retrying (%jd/%jd)", fi->url, (intmax_t)reached,
+		    err != 0 ? strerror(err) : "connection closed",
+		    (intmax_t)(retry + 1), (intmax_t)max_retry);
+		resuming = true;
 	}
-	return (ret);
 }
 
 void

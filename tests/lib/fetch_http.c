@@ -281,7 +281,7 @@ http_server_stop(struct http_server *srv)
 }
 
 /*
- * A scripted server for the retry tests: it answers one request
+ * A scripted server for the transfer resume tests: it answers one request
  * per step, in order, each time with the rest of the file from the offset
  * of the request's range (the whole file when there is none), and exits 0
  * once every step was served.  It exits with 50 + step when a request does
@@ -290,16 +290,29 @@ http_server_stop(struct http_server *srv)
  * made.
  */
 enum http_step_kind {
+	/* Announce the rest of the file, send len bytes of it, close. */
+	STEP_DROP,
+	/* Same, but reset the connection instead of closing it. */
+	STEP_RESET,
 	/* Send the rest of the file. */
 	STEP_SERVE,
+	/* Answer 200 with the whole file, ignoring the range. */
+	STEP_IGNORE_RANGE,
 	/* Fail to reopen the transfer with a retryable HTTP error. */
 	STEP_RETRY,
+	/* Fail with 429, which libfetch does not classify. */
+	STEP_RATE_LIMIT,
 	/* Return 503 for len seconds from the first request, then serve. */
 	STEP_OUTAGE,
 	/* pkg must not make this request. */
 	STEP_UNEXPECTED,
-	/* Refuse the request with 403 Forbidden. */
+	STEP_BAD_RANGE,
+	STEP_STALL,
+	STEP_REDIRECT,
 	STEP_FORBIDDEN,
+	STEP_RESET_OPEN,
+	STEP_CHUNK_DROP,
+	STEP_CHUNK_NO_END,
 };
 
 #define	RANGE_ANY	(-1)
@@ -309,6 +322,16 @@ struct http_step {
 	off_t len;		/* bytes sent, or STEP_OUTAGE duration */
 	off_t range;		/* expected range start, 0 for none */
 	const char *last_modified;
+	const char *etag;		/* NULL: default strong ETag; "": omit */
+	const char *if_range;	/* NULL: infer from the requested range */
+	const char *date;		/* NULL: fixed date; "": omit */
+	off_t size;		/* 0: SCRIPT_FILE_SIZE */
+	int version;		/* distinct bytes for a replacement */
+	bool ignore_condition;
+	bool no_length;
+	bool omit_validator;
+	bool allow_ims;
+	bool duplicate_etag;	/* send a second, different ETag */
 };
 
 #define	SCRIPT_FILE_SIZE	(64 * 1024)
@@ -324,9 +347,10 @@ static void
 script_serve(int listen_fd, const struct http_step *steps, size_t nsteps)
 {
 	static char body[SCRIPT_FILE_SIZE];
+	struct linger lg = { .l_onoff = 1, .l_linger = 0 };
 	char req[4096], hdr[512];
 	const char *r;
-	off_t start, len;
+	off_t start, len, size;
 	size_t rlen;
 	struct timespec ready, now;
 	int cfd;
@@ -339,6 +363,11 @@ script_serve(int listen_fd, const struct http_step *steps, size_t nsteps)
 	for (size_t i = 0; i < nsteps; i++) {
 		const struct http_step *s = &steps[i];
 		bool unavailable = false;
+		const char *etag = s->etag != NULL ? s->etag : "\"original\"";
+		const char *date = s->date != NULL ? s->date :
+		    "Fri, 06 Nov 2026 00:00:00 GMT";
+		const char *condition;
+		char expected_header[512];
 
 next_request:
 		cfd = accept(listen_fd, NULL, NULL);
@@ -366,10 +395,53 @@ next_request:
 			    10);
 		if (s->range != RANGE_ANY && start != s->range)
 			_exit(50 + (int)i);
-		if (start >= SCRIPT_FILE_SIZE)
-			_exit(1);
+		condition = s->if_range != NULL ? s->if_range :
+		    (start > 0 ? "\"original\"" : "");
+		r = strstr(req, "\r\nIf-Range:");
+		if (*condition != '\0') {
+			snprintf(expected_header, sizeof(expected_header),
+			    "\r\nIf-Range: %s\r\n", condition);
+			if (strstr(req, expected_header) == NULL)
+				_exit(150 + (int)i);
+		} else if (r != NULL) {
+			_exit(150 + (int)i);
+		}
+		if (!s->allow_ims &&
+		    strstr(req, "\r\nIf-Modified-Since:") != NULL)
+			_exit(175 + (int)i);
 		if (s->kind == STEP_FORBIDDEN) {
 			const char reply[] = "HTTP/1.1 403 Forbidden\r\n"
+			    "Content-Length: 0\r\nConnection: close\r\n\r\n";
+
+			write(cfd, reply, sizeof(reply) - 1);
+			close(cfd);
+			continue;
+		}
+		if (s->kind == STEP_RATE_LIMIT) {
+			const char reply[] = "HTTP/1.1 429 Too Many Requests\r\n"
+			    "Content-Length: 0\r\nConnection: close\r\n\r\n";
+
+			write(cfd, reply, sizeof(reply) - 1);
+			close(cfd);
+			continue;
+		}
+		if (s->kind == STEP_RESET_OPEN) {
+			setsockopt(cfd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+			close(cfd);
+			continue;
+		}
+		if (s->kind == STEP_BAD_RANGE) {
+			const char reply[] = "HTTP/1.1 416 Range Not Satisfiable\r\n"
+			    "Content-Range: bytes */20000\r\n"
+			    "Content-Length: 0\r\nConnection: close\r\n\r\n";
+
+			write(cfd, reply, sizeof(reply) - 1);
+			close(cfd);
+			continue;
+		}
+		if (s->kind == STEP_REDIRECT) {
+			const char reply[] = "HTTP/1.1 302 Found\r\n"
+			    "Location: /redirected\r\n"
 			    "Content-Length: 0\r\nConnection: close\r\n\r\n";
 
 			write(cfd, reply, sizeof(reply) - 1);
@@ -400,26 +472,70 @@ next_request:
 			continue;
 		}
 
-		len = SCRIPT_FILE_SIZE - start;
+		if (s->kind == STEP_IGNORE_RANGE ||
+		    (!s->ignore_condition && *condition != '\0' &&
+		    strcmp(condition, *etag != '\0' ? etag :
+		    (s->last_modified != NULL ? s->last_modified : "")) != 0))
+			start = 0;
+		size = s->size > 0 ? s->size : SCRIPT_FILE_SIZE;
+		if (start >= size || size > SCRIPT_FILE_SIZE)
+			_exit(1);
+		script_fill(body, sizeof(body));
+		for (size_t j = 0; j < sizeof(body); j++)
+			body[j] ^= s->version;
+		len = size - start;
 		if (start > 0)
 			snprintf(hdr, sizeof(hdr),
 			    "HTTP/1.1 206 Partial Content\r\n"
-			    "Content-Range: bytes %jd-%d/%d\r\n",
-			    (intmax_t)start, SCRIPT_FILE_SIZE - 1,
-			    SCRIPT_FILE_SIZE);
+			    "Content-Range: bytes %jd-%jd/%jd\r\n",
+			    (intmax_t)start, (intmax_t)size - 1, (intmax_t)size);
 		else
 			snprintf(hdr, sizeof(hdr), "HTTP/1.1 200 OK\r\n");
-		snprintf(hdr + strlen(hdr), sizeof(hdr) - strlen(hdr),
-		    "Content-Length: %jd\r\n", (intmax_t)len);
-		if (s->last_modified != NULL)
+		if (s->kind == STEP_CHUNK_DROP || s->kind == STEP_CHUNK_NO_END)
+			snprintf(hdr + strlen(hdr), sizeof(hdr) - strlen(hdr),
+			    "Transfer-Encoding: chunked\r\n");
+		else if (!s->no_length)
+			snprintf(hdr + strlen(hdr), sizeof(hdr) - strlen(hdr),
+			    "Content-Length: %jd\r\n", (intmax_t)len);
+		if (*etag != '\0' && !s->omit_validator)
+			snprintf(hdr + strlen(hdr), sizeof(hdr) - strlen(hdr),
+			    "ETag: %s\r\n", etag);
+		if (s->duplicate_etag)
+			snprintf(hdr + strlen(hdr), sizeof(hdr) - strlen(hdr),
+			    "ETag: \"duplicate\"\r\n");
+		if (*date != '\0')
+			snprintf(hdr + strlen(hdr), sizeof(hdr) - strlen(hdr),
+			    "Date: %s\r\n", date);
+		if (s->last_modified != NULL && !s->omit_validator)
 			snprintf(hdr + strlen(hdr), sizeof(hdr) - strlen(hdr),
 			    "Last-Modified: %s\r\n", s->last_modified);
 		snprintf(hdr + strlen(hdr), sizeof(hdr) - strlen(hdr),
 		    "Connection: close\r\n\r\n");
 		write(cfd, hdr, strlen(hdr));
 
+		if (s->kind == STEP_CHUNK_DROP || s->kind == STEP_CHUNK_NO_END) {
+			snprintf(hdr, sizeof(hdr), "%jx\r\n",
+			    (uintmax_t)(s->kind == STEP_CHUNK_DROP ? len : s->len));
+			write(cfd, hdr, strlen(hdr));
+			write(cfd, body + start, s->len);
+			if (s->kind == STEP_CHUNK_NO_END)
+				write(cfd, "\r\n", 2);
+			close(cfd);
+			continue;
+		}
+		if ((s->kind == STEP_DROP || s->kind == STEP_RESET ||
+		    s->kind == STEP_STALL) &&
+		    s->len < len)
+			len = s->len;
 		if (len > 0)
 			write(cfd, body + start, len);
+		if (s->kind == STEP_STALL)
+			sleep(2);
+		if (s->kind == STEP_RESET) {
+			/* Let pkg read what was sent before the reset. */
+			usleep(200 * 1000);
+			setsockopt(cfd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+		}
 		close(cfd);
 	}
 	_exit(0);
@@ -480,8 +596,9 @@ script_server_stop(struct http_server *srv, bool kill_it)
  * requests made (see script_serve()).
  */
 static void
-script_run_delay(const struct http_step *steps, size_t nsteps,
-    const char *retry, const char *delay, int expected_ret)
+script_run_config(const struct http_step *steps, size_t nsteps,
+    const char *retry, const char *delay, int expected_ret,
+    off_t expected_size, off_t max_size, off_t initial_offset)
 {
 	char path[] = "/tmp/pkg_fetch_resume_XXXXXX";
 	char expected[SCRIPT_FILE_SIZE], got[SCRIPT_FILE_SIZE + 1];
@@ -503,9 +620,17 @@ script_run_delay(const struct http_step *steps, size_t nsteps,
 	fd = mkstemp(path);
 	ATF_REQUIRE_MSG(fd != -1, "mkstemp: %s", strerror(errno));
 	unlink(path);
+	ATF_REQUIRE(fcntl(fd, F_SETFL, O_APPEND) == 0);
 
 	snprintf(url, sizeof(url), "http://127.0.0.1:%d/target", srv.port);
 	fi.url = url;
+	fi.expected_size = expected_size;
+	fi.max_size = max_size;
+	fi.offset = initial_offset;
+	if (initial_offset > 0) {
+		ATF_REQUIRE(ftruncate(fd, initial_offset) == 0);
+		fi.mtime = 1;
+	}
 	ret = pkg_fetch_file_to_fd(NULL, fd, &fi, true);
 
 	trailing = steps[nsteps - 1].kind == STEP_UNEXPECTED;
@@ -516,17 +641,36 @@ script_run_delay(const struct http_step *steps, size_t nsteps,
 	    expected_ret, ret);
 
 	if (ret == EPKG_OK) {
+		const struct http_step *last = &steps[nsteps - (trailing ? 2 : 1)];
+		off_t size = last->size > 0 ? last->size : SCRIPT_FILE_SIZE;
+
 		script_fill(expected, sizeof(expected));
+		for (size_t j = 0; j < sizeof(expected); j++)
+			expected[j] ^= last->version;
 		ATF_REQUIRE(fstat(fd, &st) == 0);
-		ATF_REQUIRE_EQ_MSG(SCRIPT_FILE_SIZE, st.st_size,
+		ATF_REQUIRE_EQ_MSG(size, st.st_size,
 		    "received %jd bytes", (intmax_t)st.st_size);
 		n = pread(fd, got, sizeof(got), 0);
-		ATF_REQUIRE_EQ(SCRIPT_FILE_SIZE, n);
-		ATF_REQUIRE_MSG(memcmp(expected, got, SCRIPT_FILE_SIZE) == 0,
+		ATF_REQUIRE_EQ(size, n);
+		ATF_REQUIRE_MSG(memcmp(expected, got, size) == 0,
 		    "received file differs from the served one");
 	}
 	close(fd);
 	pkg_shutdown();
+}
+
+static void
+script_run_delay(const struct http_step *steps, size_t nsteps,
+    const char *retry, const char *delay, int expected_ret)
+{
+	script_run_config(steps, nsteps, retry, delay, expected_ret, 0, 0, 0);
+}
+
+static void
+script_run(const struct http_step *steps, size_t nsteps, const char *retry,
+    int expected_ret)
+{
+	script_run_delay(steps, nsteps, retry, "0", expected_ret);
 }
 
 ATF_TC_WITHOUT_HEAD(http_mirror_failover);
@@ -534,6 +678,7 @@ ATF_TC_WITHOUT_HEAD(http_mirror_all_dead);
 ATF_TC_WITHOUT_HEAD(http_mirror_zero_retry);
 ATF_TC_WITHOUT_HEAD(http_mirror_not_found);
 ATF_TC_WITHOUT_HEAD(http_mirror_uptodate_mtime);
+ATF_TC_WITHOUT_HEAD(http_mirror_uptodate_mtime_whitespace);
 ATF_TC_WITHOUT_HEAD(http_mirror_uptodate_not_modified);
 ATF_TC_WITHOUT_HEAD(http_retry_backoff);
 ATF_TC_WITHOUT_HEAD(http_mirror_permanent);
@@ -548,6 +693,15 @@ ATF_TC_WITHOUT_HEAD(http_retry_disabled_delay);
 ATF_TC_WITHOUT_HEAD(http_retry_recovery);
 ATF_TC_WITHOUT_HEAD(fetch_retry_delays);
 ATF_TC_WITHOUT_HEAD(fetch_retry_interrupted_wait);
+ATF_TC_WITHOUT_HEAD(http_resume_after_drop);
+ATF_TC_WITHOUT_HEAD(http_resume_after_reset);
+ATF_TC_WITHOUT_HEAD(http_resume_progress_bounded);
+ATF_TC_WITHOUT_HEAD(http_resume_no_progress);
+ATF_TC_WITHOUT_HEAD(http_resume_zero_retry);
+ATF_TC_WITHOUT_HEAD(http_resume_range_ignored);
+ATF_TC_WITHOUT_HEAD(http_resume_file_changed);
+ATF_TC_WITHOUT_HEAD(http_resume_reconnect_budget);
+ATF_TC_WITHOUT_HEAD(http_resume_reconnect_recovery);
 
 /*
  * The first mirror is unreachable; try the second without any sleep, even
@@ -697,7 +851,8 @@ ATF_TC_BODY(http_mirror_not_found, tc)
  * older than the requested mtime: libfetch_open() must report EPKG_UPTODATE
  * without leaving a handle open.
  */
-ATF_TC_BODY(http_mirror_uptodate_mtime, tc)
+static void
+uptodate_mtime(const char *last_modified)
 {
 	char dir[] = "/tmp/pkg_http_mirror_XXXXXX";
 	struct http_server srv;
@@ -708,8 +863,7 @@ ATF_TC_BODY(http_mirror_uptodate_mtime, tc)
 
 	ATF_REQUIRE(mkdtemp(dir) != NULL);
 	make_repo_file(dir, "target", "hello\n");
-	srv = http_server_start(dir, HTTP_REPLY_OK,
-	    "Wed, 01 Jan 2020 00:00:00 GMT");
+	srv = http_server_start(dir, HTTP_REPLY_OK, last_modified);
 	ATF_REQUIRE_EQ(EPKG_OK, pkg_ini(NULL, NULL, 0));
 
 	repo = make_http_repo();
@@ -729,6 +883,17 @@ ATF_TC_BODY(http_mirror_uptodate_mtime, tc)
 	http_server_stop(&srv);
 	unlinkat(open(dir, O_DIRECTORY), "target", 0);
 	rmdir(dir);
+}
+
+ATF_TC_BODY(http_mirror_uptodate_mtime, tc)
+{
+	uptodate_mtime("Wed, 01 Jan 2020 00:00:00 GMT");
+}
+
+/* Trailing whitespace is not part of the Last-Modified value. */
+ATF_TC_BODY(http_mirror_uptodate_mtime_whitespace, tc)
+{
+	uptodate_mtime("Wed, 01 Jan 2020 00:00:00 GMT \t");
 }
 
 /*
@@ -824,20 +989,20 @@ retry_script(mirror_t type, const char *retries, const char *delay,
 	struct retry_trace trace = { .expected = expected };
 	char url[MAXPATHLEN];
 	const struct http_step first_steps[] = {
-		{ first_kind, 0, 0, NULL },
-		{ first_kind, 0, 0, NULL },
-		{ first_kind, 0, 0, NULL },
-		{ first_kind, 0, 0, NULL },
-		{ first_kind, 0, 0, NULL },
-		{ STEP_UNEXPECTED, 0, 0, NULL },
+		{ .kind = first_kind },
+		{ .kind = first_kind },
+		{ .kind = first_kind },
+		{ .kind = first_kind },
+		{ .kind = first_kind },
+		{ .kind = STEP_UNEXPECTED },
 	};
 	const struct http_step second_steps[] = {
-		{ second_kind, 0, 0, NULL },
-		{ second_kind, 0, 0, NULL },
-		{ second_kind, 0, 0, NULL },
-		{ second_kind, 0, 0, NULL },
-		{ second_kind, 0, 0, NULL },
-		{ STEP_UNEXPECTED, 0, 0, NULL },
+		{ .kind = second_kind },
+		{ .kind = second_kind },
+		{ .kind = second_kind },
+		{ .kind = second_kind },
+		{ .kind = second_kind },
+		{ .kind = STEP_UNEXPECTED },
 	};
 	struct http_server first, second;
 
@@ -925,8 +1090,8 @@ ATF_TC_BODY(http_retry_disabled_delay, tc)
 ATF_TC_BODY(srv_mirror_failover, tc)
 {
 	const struct http_step steps[] = {
-		{ STEP_RETRY, 0, 0, NULL },
-		{ STEP_UNEXPECTED, 0, 0, NULL },
+		{ .kind = STEP_RETRY, .allow_ims = true },
+		{ .kind = STEP_UNEXPECTED },
 	};
 	struct http_server srv, dead;
 	struct pkg_repo repo = make_http_repo();
@@ -954,8 +1119,8 @@ ATF_TC_BODY(srv_mirror_failover, tc)
 ATF_TC_BODY(http_retry_recovery, tc)
 {
 	const struct http_step steps[] = {
-		{ STEP_OUTAGE, 4, 0, NULL },
-		{ STEP_UNEXPECTED, 0, 0, NULL },
+		{ .kind = STEP_OUTAGE, .len = 4 },
+		{ .kind = STEP_UNEXPECTED },
 	};
 
 	ATF_REQUIRE_EQ(0, unsetenv("FETCH_RETRY"));
@@ -1013,6 +1178,530 @@ ATF_TC_BODY(fetch_retry_interrupted_wait, tc)
 	pkg_shutdown();
 }
 
+/*
+ * The connection is closed a sixth of the way through: pkg must ask for the
+ * rest of the file only, and end up with the whole file.  Before, the fetch
+ * failed outright ("fetch size does not match expected package size"), or
+ * silently returned a truncated file when no size was expected.
+ */
+ATF_TC_BODY(http_resume_after_drop, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000 },
+		{ .kind = STEP_SERVE, .range = 10000 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), NULL, EPKG_OK);
+}
+
+/*
+ * The connection is reset mid-transfer, a read error rather than an early
+ * end of file ("An error occurred while fetching package" before): it is
+ * resumed the same way.
+ */
+ATF_TC_BODY(http_resume_after_reset, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_RESET, .len = 10000 },
+		{ .kind = STEP_SERVE, .range = RANGE_ANY },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), NULL, EPKG_OK);
+}
+
+/* Progress does not replenish the total recovery budget. */
+ATF_TC_BODY(http_resume_progress_bounded, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000 },
+		{ .kind = STEP_DROP, .len = 10000, .range = 10000 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "1", EPKG_FATAL);
+}
+
+/*
+ * After the first interruption no more data comes: with FETCH_RETRY=2 pkg
+ * resumes twice, then gives up without a further request.
+ */
+ATF_TC_BODY(http_resume_no_progress, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000 },
+		{ .kind = STEP_DROP, .range = 10000 },
+		{ .kind = STEP_DROP, .range = 10000 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "2", EPKG_FATAL);
+}
+
+/* FETCH_RETRY=0 disables resuming too. */
+ATF_TC_BODY(http_resume_zero_retry, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "0", EPKG_FATAL);
+}
+
+/*
+ * The server answers the range request with the whole file: what was
+ * already received must be dropped rather than kept in front of it.
+ */
+ATF_TC_BODY(http_resume_range_ignored, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000 },
+		{ .kind = STEP_IGNORE_RANGE, .range = 10000 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), NULL, EPKG_OK);
+}
+
+/*
+ * The file changed on the server between the interruption and the resumed
+ * request (its Last-Modified differs): the parts would not match, so pkg
+ * must start over from the beginning.
+ */
+ATF_TC_BODY(http_resume_file_changed, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000, .etag = "",
+		  .last_modified = "Wed, 01 Jan 2025 00:00:00 GMT" },
+		{ .kind = STEP_SERVE, .range = 10000, .etag = "",
+		  .if_range = "Wed, 01 Jan 2025 00:00:00 GMT",
+		  .last_modified = "Thu, 02 Jan 2025 00:00:00 GMT",
+		  .ignore_condition = true, .version = 1 },
+		{ .kind = STEP_SERVE, .etag = "", .version = 1,
+		  .last_modified = "Thu, 02 Jan 2025 00:00:00 GMT" },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "2", EPKG_OK);
+}
+
+/* Failed reconnections must not each start another FETCH_RETRY budget. */
+ATF_TC_BODY(http_resume_reconnect_budget, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000 },
+		{ .kind = STEP_RETRY, .range = 10000 },
+		{ .kind = STEP_RETRY, .range = 10000 },
+		{ .kind = STEP_RETRY, .range = 10000 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "3", EPKG_FATAL);
+}
+
+ATF_TC_BODY(http_resume_reconnect_recovery, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000 },
+		{ .kind = STEP_RETRY, .range = 10000 },
+		{ .kind = STEP_SERVE, .range = 10000 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "2", EPKG_OK);
+}
+
+/* A 429 while reconnecting is retried, as it is when opening. */
+ATF_TC_WITHOUT_HEAD(http_resume_reconnect_unknown);
+ATF_TC_BODY(http_resume_reconnect_unknown, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000 },
+		{ .kind = STEP_RATE_LIMIT, .range = 10000 },
+		{ .kind = STEP_SERVE, .range = 10000 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "2", EPKG_OK);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_etag_changed);
+ATF_TC_BODY(http_resume_etag_changed, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000 },
+		{ .kind = STEP_SERVE, .range = 10000,
+		  .etag = "\"replacement\"", .version = 1 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "1", EPKG_OK);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_invalid_validator);
+ATF_TC_BODY(http_resume_invalid_validator, tc)
+{
+	/* Reject a 206 whose ETag contradicts If-Range before writing it. */
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000 },
+		{ .kind = STEP_SERVE, .range = 10000,
+		  .etag = "\"replacement\"", .version = 1,
+		  .ignore_condition = true },
+		{ .kind = STEP_SERVE, .etag = "\"replacement\"", .version = 1 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "2", EPKG_OK);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_no_validator);
+ATF_TC_BODY(http_resume_no_validator, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000, .etag = "" },
+		{ .kind = STEP_SERVE, .etag = "", .version = 1 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "1", EPKG_OK);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_weak_etag);
+ATF_TC_BODY(http_resume_weak_etag, tc)
+{
+	/* A weak ETag also prevents falling back to Last-Modified. */
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000, .etag = "W/\"original\"",
+		  .last_modified = "Wed, 01 Jan 2025 00:00:00 GMT" },
+		{ .kind = STEP_SERVE, .etag = "W/\"replacement\"", .version = 1 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "1", EPKG_OK);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_weak_date);
+ATF_TC_BODY(http_resume_weak_date, tc)
+{
+	/* Last-Modified alone is not proof of byte-for-byte identity. */
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000, .etag = "",
+		  .date = "Wed, 01 Jan 2025 00:00:30 GMT",
+		  .last_modified = "Wed, 01 Jan 2025 00:00:00 GMT" },
+		{ .kind = STEP_SERVE, .etag = "", .version = 1 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "1", EPKG_OK);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_date_validator);
+ATF_TC_BODY(http_resume_date_validator, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000, .etag = "",
+		  .date = "Wed, 01 Jan 2025 00:01:00 GMT",
+		  .last_modified = "Wed, 01 Jan 2025 00:00:00 GMT" },
+		{ .kind = STEP_SERVE, .range = 10000, .etag = "",
+		  .if_range = "Wed, 01 Jan 2025 00:00:00 GMT",
+		  .last_modified = "Wed, 01 Jan 2025 00:00:00 GMT" },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "1", EPKG_OK);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_restart_interrupted);
+ATF_TC_BODY(http_resume_restart_interrupted, tc)
+{
+	/* Replacement B is interrupted below A's old high-water offset. */
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 50000 },
+		{ .kind = STEP_DROP, .len = 10000, .range = 50000,
+		  .etag = "\"replacement\"", .version = 1 },
+		{ .kind = STEP_SERVE, .range = 10000,
+		  .if_range = "\"replacement\"",
+		  .etag = "\"replacement\"", .version = 1 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "2", EPKG_OK);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_shrunk);
+ATF_TC_BODY(http_resume_shrunk, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 50000 },
+		{ .kind = STEP_BAD_RANGE, .range = 50000 },
+		{ .kind = STEP_SERVE, .size = 20000, .version = 1 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "2", EPKG_OK);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_restart_bounded);
+ATF_TC_BODY(http_resume_restart_bounded, tc)
+{
+	/* Even the full GET after a 416 must consume a recovery attempt. */
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 50000 },
+		{ .kind = STEP_BAD_RANGE, .range = 50000 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "1", EPKG_FATAL);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_redirect);
+ATF_TC_BODY(http_resume_redirect, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000 },
+		{ .kind = STEP_REDIRECT, .range = 10000 },
+		{ .kind = STEP_SERVE, .range = 10000 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "1", EPKG_OK);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_stall);
+ATF_TC_BODY(http_resume_stall, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_STALL, .len = 10000 },
+		{ .kind = STEP_SERVE, .range = RANGE_ANY },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	ATF_REQUIRE_EQ(0, setenv("FETCH_TIMEOUT", "1", 1));
+	script_run_delay(steps, NELEM(steps), "2", "1", EPKG_OK);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_unknown_length);
+ATF_TC_BODY(http_resume_unknown_length, tc)
+{
+	/* The caller's expected size detects early EOF without Content-Length. */
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000, .no_length = true },
+		{ .kind = STEP_SERVE, .range = 10000 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run_config(steps, NELEM(steps), "1", "0", EPKG_OK,
+	    SCRIPT_FILE_SIZE, 0, 0);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_size_limit);
+ATF_TC_BODY(http_resume_size_limit, tc)
+{
+	/* A replacement discovered during recovery cannot bypass max_size. */
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000, .size = 20000 },
+		{ .kind = STEP_SERVE, .range = 10000,
+		  .etag = "\"replacement\"", .version = 1 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run_config(steps, NELEM(steps), "1", "0", EPKG_FATAL, 0, 30000, 0);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_expected_size);
+ATF_TC_BODY(http_resume_expected_size, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000, .size = 20000 },
+		{ .kind = STEP_SERVE, .range = 10000,
+		  .etag = "\"replacement\"", .version = 1 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run_config(steps, NELEM(steps), "1", "0", EPKG_FATAL, 20000, 0, 0);
+}
+
+static int
+cancel_progress(void *data, struct pkg_event *ev)
+{
+	(void)data;
+	return (ev->type == PKG_EVENT_PROGRESS_TICK);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_oversized_etag);
+ATF_TC_BODY(http_resume_oversized_etag, tc)
+{
+	char etag[300];
+	struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000, .etag = etag },
+		{ .kind = STEP_SERVE, .version = 1 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	memset(etag, 'a', sizeof(etag));
+	etag[0] = etag[sizeof(etag) - 2] = '"';
+	etag[sizeof(etag) - 1] = '\0';
+	script_run(steps, NELEM(steps), "1", EPKG_OK);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_malformed_etag);
+ATF_TC_BODY(http_resume_malformed_etag, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000, .etag = "not-quoted" },
+		{ .kind = STEP_SERVE, .version = 1 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "1", EPKG_OK);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_validator_omitted);
+ATF_TC_BODY(http_resume_validator_omitted, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000 },
+		{ .kind = STEP_DROP, .len = 10000, .range = 10000,
+		  .omit_validator = true },
+		{ .kind = STEP_SERVE, .range = 20000 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "2", EPKG_OK);
+}
+
+/*
+ * Two ETags leave no validator: the response is still accepted, but the
+ * interrupted transfer restarts without a range, and without falling back
+ * to the otherwise eligible Last-Modified date.
+ */
+ATF_TC_WITHOUT_HEAD(http_resume_duplicate_etag);
+ATF_TC_BODY(http_resume_duplicate_etag, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000, .duplicate_etag = true,
+		  .last_modified = "Wed, 01 Jan 2025 00:00:00 GMT" },
+		{ .kind = STEP_SERVE, .duplicate_etag = true,
+		  .last_modified = "Wed, 01 Jan 2025 00:00:00 GMT" },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "2", EPKG_OK);
+}
+
+/*
+ * Trailing whitespace after Last-Modified and Date is not part of their
+ * values: the date still validates the range, and is sent back without it.
+ */
+ATF_TC_WITHOUT_HEAD(http_resume_date_whitespace);
+ATF_TC_BODY(http_resume_date_whitespace, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000, .etag = "",
+		  .last_modified = "Wed, 01 Jan 2025 00:00:00 GMT \t",
+		  .date = "Fri, 06 Nov 2026 00:00:00 GMT " },
+		{ .kind = STEP_SERVE, .range = 10000, .etag = "",
+		  .if_range = "Wed, 01 Jan 2025 00:00:00 GMT",
+		  .last_modified = "Wed, 01 Jan 2025 00:00:00 GMT ",
+		  .ignore_condition = true },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "2", EPKG_OK);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_etag_whitespace);
+ATF_TC_BODY(http_resume_etag_whitespace, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000, .etag = "\"original\" " },
+		{ .kind = STEP_SERVE, .range = 10000, .etag = "\"original\"\t",
+		  .if_range = "\"original\"", .ignore_condition = true },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "2", EPKG_OK);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_forbidden);
+ATF_TC_BODY(http_resume_forbidden, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000 },
+		{ .kind = STEP_FORBIDDEN, .range = 10000 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "5", EPKG_FATAL);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_reset_open);
+ATF_TC_BODY(http_resume_reset_open, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_DROP, .len = 10000 },
+		{ .kind = STEP_RESET_OPEN, .range = 10000 },
+		{ .kind = STEP_SERVE, .range = 10000 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "2", EPKG_OK);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_old_partial);
+ATF_TC_BODY(http_resume_old_partial, tc)
+{
+	/* A previous invocation's bytes have no stored HTTP validator. */
+	const struct http_step steps[] = {
+		{ .kind = STEP_SERVE, .version = 1 },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run_config(steps, NELEM(steps), "1", "0", EPKG_OK,
+	    0, 0, 10000);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_cancel);
+ATF_TC_BODY(http_resume_cancel, tc)
+{
+	const struct http_step steps[] = {
+		{ .kind = STEP_SERVE },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	pkg_event_register(cancel_progress, NULL);
+	script_run(steps, NELEM(steps), "5", EPKG_CANCEL);
+	pkg_event_register(NULL, NULL);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_chunk_drop);
+ATF_TC_BODY(http_resume_chunk_drop, tc)
+{
+	/* No Content-Length or expected size: chunk framing detects the EOF. */
+	const struct http_step steps[] = {
+		{ .kind = STEP_CHUNK_DROP, .len = 10000 },
+		{ .kind = STEP_SERVE, .range = RANGE_ANY },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "1", EPKG_OK);
+}
+
+ATF_TC_WITHOUT_HEAD(http_resume_chunk_no_end);
+ATF_TC_BODY(http_resume_chunk_no_end, tc)
+{
+	/* No Content-Length or expected size: chunk framing detects the EOF. */
+	const struct http_step steps[] = {
+		{ .kind = STEP_CHUNK_NO_END, .len = 10000 },
+		{ .kind = STEP_SERVE, .range = RANGE_ANY },
+		{ .kind = STEP_UNEXPECTED },
+	};
+
+	script_run(steps, NELEM(steps), "1", EPKG_OK);
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 	ATF_TP_ADD_TC(tp, http_mirror_failover);
@@ -1020,6 +1709,7 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, http_mirror_zero_retry);
 	ATF_TP_ADD_TC(tp, http_mirror_not_found);
 	ATF_TP_ADD_TC(tp, http_mirror_uptodate_mtime);
+	ATF_TP_ADD_TC(tp, http_mirror_uptodate_mtime_whitespace);
 	ATF_TP_ADD_TC(tp, http_mirror_uptodate_not_modified);
 	ATF_TP_ADD_TC(tp, http_retry_backoff);
 	ATF_TP_ADD_TC(tp, http_mirror_permanent);
@@ -1034,6 +1724,45 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, http_retry_recovery);
 	ATF_TP_ADD_TC(tp, fetch_retry_delays);
 	ATF_TP_ADD_TC(tp, fetch_retry_interrupted_wait);
+	ATF_TP_ADD_TC(tp, http_resume_after_drop);
+	ATF_TP_ADD_TC(tp, http_resume_after_reset);
+	ATF_TP_ADD_TC(tp, http_resume_progress_bounded);
+	ATF_TP_ADD_TC(tp, http_resume_no_progress);
+	ATF_TP_ADD_TC(tp, http_resume_zero_retry);
+	ATF_TP_ADD_TC(tp, http_resume_range_ignored);
+	ATF_TP_ADD_TC(tp, http_resume_file_changed);
+	ATF_TP_ADD_TC(tp, http_resume_reconnect_budget);
+	ATF_TP_ADD_TC(tp, http_resume_reconnect_recovery);
+	ATF_TP_ADD_TC(tp, http_resume_reconnect_unknown);
+
+	ATF_TP_ADD_TC(tp, http_resume_etag_changed);
+	ATF_TP_ADD_TC(tp, http_resume_invalid_validator);
+	ATF_TP_ADD_TC(tp, http_resume_no_validator);
+	ATF_TP_ADD_TC(tp, http_resume_weak_etag);
+	ATF_TP_ADD_TC(tp, http_resume_weak_date);
+	ATF_TP_ADD_TC(tp, http_resume_date_validator);
+	ATF_TP_ADD_TC(tp, http_resume_restart_interrupted);
+	ATF_TP_ADD_TC(tp, http_resume_shrunk);
+	ATF_TP_ADD_TC(tp, http_resume_restart_bounded);
+	ATF_TP_ADD_TC(tp, http_resume_redirect);
+	ATF_TP_ADD_TC(tp, http_resume_stall);
+	ATF_TP_ADD_TC(tp, http_resume_unknown_length);
+	ATF_TP_ADD_TC(tp, http_resume_size_limit);
+	ATF_TP_ADD_TC(tp, http_resume_expected_size);
+
+	ATF_TP_ADD_TC(tp, http_resume_oversized_etag);
+	ATF_TP_ADD_TC(tp, http_resume_malformed_etag);
+	ATF_TP_ADD_TC(tp, http_resume_validator_omitted);
+	ATF_TP_ADD_TC(tp, http_resume_duplicate_etag);
+	ATF_TP_ADD_TC(tp, http_resume_date_whitespace);
+	ATF_TP_ADD_TC(tp, http_resume_etag_whitespace);
+	ATF_TP_ADD_TC(tp, http_resume_forbidden);
+	ATF_TP_ADD_TC(tp, http_resume_reset_open);
+	ATF_TP_ADD_TC(tp, http_resume_old_partial);
+	ATF_TP_ADD_TC(tp, http_resume_cancel);
+
+	ATF_TP_ADD_TC(tp, http_resume_chunk_drop);
+	ATF_TP_ADD_TC(tp, http_resume_chunk_no_end);
 
 	return (atf_no_error());
 }

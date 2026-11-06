@@ -77,6 +77,7 @@
 #include <netdb.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -199,7 +200,9 @@ struct httpio {
 };
 
 /*
- * Get next chunk header
+ * Get next chunk header.  Returns 1 if a chunk of data follows, 0 at the
+ * terminating zero-size chunk and -1 if the header is malformed, which
+ * includes the connection closing where a chunk header was expected.
  */
 static int
 http_new_chunk(struct httpio *io)
@@ -212,6 +215,8 @@ http_new_chunk(struct httpio *io)
 	for (p = io->conn->line;
 	     *p != '\0' && !isspace((unsigned char)*p) && *p != ';';
 	     p++) {
+		if (io->chunksize > SIZE_MAX >> 4)
+			return (-1);
 		io->chunksize <<= 4;
 		if (*p >= '0' && *p <= '9')
 			io->chunksize += *p - '0';
@@ -222,6 +227,10 @@ http_new_chunk(struct httpio *io)
 		else
 			return (-1);
 	}
+
+	/* no size at all: an empty line or a bare chunk extension */
+	if (p == io->conn->line)
+		return (-1);
 
 #ifndef NDEBUG
 	if (fetchDebug) {
@@ -235,7 +244,7 @@ http_new_chunk(struct httpio *io)
 	}
 #endif
 
-	return (io->chunksize);
+	return (io->chunksize != 0);
 }
 
 /*
@@ -315,18 +324,24 @@ http_fillbuf(struct httpio *io, size_t len)
 		len = io->chunksize;
 	if (http_growbuf(io, len) == -1)
 		return (-1);
-	if ((nbytes = fetch_bufread(io->conn, io->buf, len)) == -1) {
-		io->error = errno;
+	if ((nbytes = fetch_bufread(io->conn, io->buf, len)) <= 0) {
+		/* a close inside a chunk is a truncated body, not EOF */
+		io->error = (nbytes == -1) ? errno : EPROTO;
 		return (-1);
 	}
 	io->bufpos = 0;
 	io->buflen = nbytes;
 	io->chunksize -= nbytes;
 
+	/* the chunk data must be followed by CRLF */
 	if (io->chunksize == 0) {
-		if (fetch_bufread(io->conn, &ch, 1) != 1 || ch != '\r' ||
-		    fetch_bufread(io->conn, &ch, 1) != 1 || ch != '\n')
+		if ((nbytes = fetch_bufread(io->conn, &ch, 1)) != 1 ||
+		    ch != '\r' ||
+		    (nbytes = fetch_bufread(io->conn, &ch, 1)) != 1 ||
+		    ch != '\n') {
+			io->error = (nbytes == -1) ? errno : EPROTO;
 			return (-1);
+		}
 	}
 
 	return (io->buflen);
@@ -492,6 +507,8 @@ typedef enum {
 	hdr_unknown = 1,
 	hdr_content_length,
 	hdr_content_range,
+	hdr_etag,
+	hdr_date,
 	hdr_last_modified,
 	hdr_location,
 	hdr_transfer_encoding,
@@ -507,6 +524,8 @@ static struct {
 } hdr_names[] = {
 	{ hdr_content_length,		"Content-Length" },
 	{ hdr_content_range,		"Content-Range" },
+	{ hdr_etag,			"ETag" },
+	{ hdr_date,			"Date" },
 	{ hdr_last_modified,		"Last-Modified" },
 	{ hdr_location,			"Location" },
 	{ hdr_transfer_encoding,	"Transfer-Encoding" },
@@ -1015,11 +1034,43 @@ http_parse_mtime(const char *p, time_t *mtime)
 	/* XXX should add support for date-2 and date-3 */
 	if (r == NULL)
 		return (-1);
+	/* Trailing whitespace is not part of the value (RFC 9110 5.5). */
+	while (*r == ' ' || *r == '\t')
+		r++;
+	if (*r != '\0')
+		return (-1);
 	DEBUGF("last modified: [%04d-%02d-%02d %02d:%02d:%02d]\n",
 	    tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
 	    tm.tm_hour, tm.tm_min, tm.tm_sec);
 	*mtime = timegm(&tm);
 	return (0);
+}
+
+/* Length of a header value without its trailing whitespace. */
+static size_t
+http_value_len(const char *p)
+{
+	size_t len = strlen(p);
+
+	while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\t'))
+		len--;
+	return (len);
+}
+
+/* RFC 9110: weak, malformed and oversized ETags cannot validate a range. */
+static bool
+http_strong_etag(const char *p, size_t len)
+{
+	if (len < 2 || len >= FETCH_VALIDATOR_SIZE ||
+	    p[0] != '"' || p[len - 1] != '"')
+		return (false);
+	for (size_t i = 1; i < len - 1; i++) {
+		unsigned char c = p[i];
+
+		if (c < 0x21 || c == '"' || c == 0x7f)
+			return (false);
+	}
+	return (true);
 }
 
 /*
@@ -1774,7 +1825,10 @@ http_request_body(struct url *URL, const char *op, struct url_stat *us,
 	    verbose;
 	int e, i, n, val;
 	off_t offset, clength, length, size;
-	time_t mtime;
+	time_t mtime, date;
+	char validator[FETCH_VALIDATOR_SIZE], modified[80];
+	size_t vlen;
+	bool has_etag, has_modified;
 	const char *p;
 	FILE *f;
 	hdr_t h;
@@ -1817,6 +1871,9 @@ http_request_body(struct url *URL, const char *op, struct url_stat *us,
 		length = -1;
 		size = -1;
 		mtime = 0;
+		date = 0;
+		validator[0] = modified[0] = '\0';
+		has_etag = has_modified = false;
 
 		/* check port */
 		if (!url->port)
@@ -1948,8 +2005,11 @@ http_request_body(struct url *URL, const char *op, struct url_stat *us,
 			http_cmd(conn, "User-Agent: %s " _LIBFETCH_VER,
 			    getprogname());
 		}
-		if (url->offset > 0)
+		if (url->offset > 0) {
 			http_cmd(conn, "Range: bytes=%lld-", (long long)url->offset);
+			if (url->if_range != NULL && *url->if_range != '\0')
+				http_cmd(conn, "If-Range: %s", url->if_range);
+		}
 
 		/* custom headers from the API and environment */
 		if (fetchCustomHTTPHeaders != NULL)
@@ -2081,8 +2141,32 @@ http_request_body(struct url *URL, const char *op, struct url_stat *us,
 			case hdr_content_range:
 				http_parse_range(p, &offset, &length, &size);
 				break;
+			case hdr_etag:
+				/*
+				 * A repeated ETag is ambiguous: keep no
+				 * validator, not even a date, but still
+				 * accept the response.
+				 */
+				vlen = http_value_len(p);
+				if (has_etag)
+					validator[0] = '\0';
+				else if (http_strong_etag(p, vlen)) {
+					memcpy(validator, p, vlen);
+					validator[vlen] = '\0';
+				}
+				has_etag = true;
+				break;
+			case hdr_date:
+				http_parse_mtime(p, &date);
+				break;
 			case hdr_last_modified:
-				http_parse_mtime(p, &mtime);
+				has_modified = true;
+				vlen = http_value_len(p);
+				if (http_parse_mtime(p, &mtime) == 0 &&
+				    vlen < sizeof(modified)) {
+					memcpy(modified, p, vlen);
+					modified[vlen] = '\0';
+				}
 				break;
 			case hdr_location:
 				if (!HTTP_REDIRECT(conn->err))
@@ -2124,6 +2208,7 @@ http_request_body(struct url *URL, const char *op, struct url_stat *us,
 				loc->offset = url->offset;
 				loc->length = url->length;
 				loc->ims_time = url->ims_time;
+				loc->if_range = url->if_range;
 				break;
 			case hdr_transfer_encoding:
 				/* XXX weak test*/
@@ -2172,6 +2257,12 @@ http_request_body(struct url *URL, const char *op, struct url_stat *us,
 
 		/* requested range not satisfiable */
 		if (conn->err == HTTP_BAD_RANGE) {
+			if (url->if_range != NULL) {
+				fetchLastErrCode = FETCH_RESTART;
+				strlcpy(fetchLastErrString, "range no longer available",
+				    sizeof(fetchLastErrString));
+				goto ouch;
+			}
 			if (url->offset > 0 && url->length == 0) {
 				/* asked for 0 bytes; fake it */
 				offset = url->offset;
@@ -2220,6 +2311,26 @@ http_request_body(struct url *URL, const char *op, struct url_stat *us,
 		goto ouch;
 	}
 
+	/* A date is strong only when at least 60 seconds older than Date. */
+	if (!has_etag && modified[0] != '\0' && date != 0 &&
+	    difftime(date, mtime) >= 60)
+		strlcpy(validator, modified, sizeof(validator));
+	if (conn->err == HTTP_PARTIAL && URL->if_range != NULL) {
+		/* Reject inconsistent responses before exposing any body bytes. */
+		if (offset != URL->offset ||
+		    (URL->if_range[0] == '"' && has_etag &&
+		    strcmp(validator, URL->if_range) != 0) ||
+		    (URL->if_range[0] != '"' && has_modified &&
+		    strcmp(modified, URL->if_range) != 0)) {
+			fetchLastErrCode = FETCH_RESTART;
+			strlcpy(fetchLastErrString, "range validator changed",
+			    sizeof(fetchLastErrString));
+			goto ouch;
+		}
+		/* A conditional 206 may omit the original validator. */
+		strlcpy(validator, URL->if_range, sizeof(validator));
+	}
+
 	/* check for inconsistencies */
 	if (clength != -1 && length != -1 && clength != length) {
 		http_seterr(HTTP_PROTOCOL_ERROR);
@@ -2240,6 +2351,7 @@ http_request_body(struct url *URL, const char *op, struct url_stat *us,
 	if (us) {
 		us->size = size;
 		us->atime = us->mtime = mtime;
+		strlcpy(us->validator, validator, sizeof(us->validator));
 	}
 
 	/* too far? */

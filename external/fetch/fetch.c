@@ -84,6 +84,7 @@ fetchXGet(struct url *URL, struct url_stat *us, const char *flags)
 	if (us != NULL) {
 		us->size = -1;
 		us->atime = us->mtime = 0;
+		us->validator[0] = '\0';
 	}
 	if (strcmp(URL->scheme, SCHEME_HTTP) == 0)
 		return (fetchXGetHTTP(URL, us, flags));

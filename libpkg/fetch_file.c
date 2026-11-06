@@ -114,14 +114,30 @@ fh_close(struct pkg_repo *repo)
 	repo->fh = NULL;
 }
 
+/*
+ * Copy the body of an open transfer to dest.
+ *
+ * EPKG_AGAIN means the transfer was cut short, either by a read error or by
+ * the stream ending before the size the server announced.  *reached is then
+ * the offset the transfer got to and *err the errno of the read error (0 when
+ * the stream merely ended early), so a fetcher able to reopen a transfer at
+ * an offset can resume it.  With resuming set the call continues such an
+ * interrupted transfer: the fetch was already announced, so only the progress
+ * meter is started again.
+ */
 int
-stdio_fetch(struct pkg_repo *repo, int dest, struct fetch_item *fi)
+stdio_fetch_part(struct pkg_repo *repo, int dest, struct fetch_item *fi,
+    bool resuming, off_t *reached, int *err)
 {
 	char buf[8192];
 	size_t buflen = 0, left = 0;
 	off_t done = 0, r;
+	int rerrno;
 
-	pkg_emit_fetch_begin(fi->url);
+	*err = 0;
+	*reached = fi->offset;
+	if (!resuming)
+		pkg_emit_fetch_begin(fi->url);
 	pkg_emit_progress_start(NULL);
 	if (fi->offset > 0)
 		done += fi->offset;
@@ -146,12 +162,14 @@ stdio_fetch(struct pkg_repo *repo, int dest, struct fetch_item *fi)
 			left = fi->expected_size - done;
 	}
 
+	errno = 0;
 	while ((r = fread(buf, 1, left < buflen ? left : buflen, repo->fh)) > 0) {
 		if (write(dest, buf, r) != r) {
 			pkg_emit_errno("write", "");
 			return (EPKG_FATAL);
 		}
 		done += r;
+		*reached = done;
 		if (fi->size > 0 || fi->max_size > 0 || fi->expected_size > 0) {
 			left -= r;
 		}
@@ -161,7 +179,9 @@ stdio_fetch(struct pkg_repo *repo, int dest, struct fetch_item *fi)
 			pkg_dbg(PKG_DBG_FETCH, 1,  "Read status: %jd", (intmax_t)done);
 		if (fi->size > 0 && pkg_emit_progress_tick(done, fi->size))
 			return (EPKG_CANCEL);
+		errno = 0;
 	}
+	rerrno = errno;
 	if (fi->max_size > 0 && done == fi->max_size &&
 	    (fi->size == 0 || fi->size > fi->max_size)) {
 		pkg_emit_error("fetch exceeds configured size limit");
@@ -174,12 +194,47 @@ stdio_fetch(struct pkg_repo *repo, int dest, struct fetch_item *fi)
 		return (EPKG_FATAL);
 	}
 	if (ferror(repo->fh)) {
-		pkg_emit_error("An error occurred while fetching package");
-		return(EPKG_FATAL);
+		*err = rerrno != 0 ? rerrno : EIO;
+		return (EPKG_AGAIN);
 	}
+	/* The stream ended before the announced size: a truncated transfer. */
+	if ((fi->size > 0 && done < fi->size) ||
+	    (fi->size == 0 && fi->expected_size > 0 &&
+	    done < fi->expected_size))
+		return (EPKG_AGAIN);
 	if (fi->expected_size > 0 && done != fi->expected_size) {
 		pkg_emit_error("fetch size does not match expected package size");
 		return (EPKG_FATAL);
 	}
 	return (EPKG_OK);
+}
+
+void
+fetch_emit_interrupted(const struct fetch_item *fi, off_t reached, int err)
+{
+	if (err != 0)
+		pkg_emit_error("An error occurred while fetching %s: %s",
+		    fi->url, strerror(err));
+	else
+		pkg_emit_error("An error occurred while fetching %s: "
+		    "transfer ended after %jd of %jd bytes", fi->url,
+		    (intmax_t)reached, (intmax_t)fi->size);
+}
+
+/*
+ * Copy the body of an open transfer to dest, for fetchers which cannot resume
+ * an interrupted transfer.
+ */
+int
+stdio_fetch(struct pkg_repo *repo, int dest, struct fetch_item *fi)
+{
+	off_t reached;
+	int err, ret;
+
+	ret = stdio_fetch_part(repo, dest, fi, false, &reached, &err);
+	if (ret == EPKG_AGAIN) {
+		fetch_emit_interrupted(fi, reached, err);
+		ret = EPKG_FATAL;
+	}
+	return (ret);
 }

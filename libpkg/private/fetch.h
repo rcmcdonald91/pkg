@@ -27,6 +27,8 @@
 
 #pragma once
 
+#include "../../external/fetch/fetch.h"
+
 /* Upper bound, in seconds, of the delay between two fetch attempts. */
 #define FETCH_RETRY_DELAY_MAX	60
 
@@ -35,8 +37,15 @@ struct fetch_item {
 	off_t size;
 	off_t max_size;
 	off_t expected_size;
+	/*
+	 * Offset to start the transfer at.  libfetch_open() updates it to
+	 * the offset the server actually starts at, which is 0 when it
+	 * ignored the range request.
+	 */
 	off_t offset;
 	time_t mtime;
+	/* Strong HTTP validator for bytes received during this fetch. */
+	char http_validator[FETCH_VALIDATOR_SIZE];
 };
 
 struct fetcher {
@@ -53,6 +62,9 @@ int file_open(struct pkg_repo *, struct fetch_item *);
 void fh_close(struct pkg_repo *);
 int tcp_open(struct pkg_repo *, struct fetch_item *);
 int stdio_fetch(struct pkg_repo *, int dest, struct fetch_item *);
+int stdio_fetch_part(struct pkg_repo *, int dest, struct fetch_item *,
+    bool resuming, off_t *reached, int *err);
+void fetch_emit_interrupted(const struct fetch_item *, off_t reached, int err);
 unsigned int fetch_retry_delay(int64_t delay, int64_t attempt);
 void fetch_retry_wait(int64_t attempt);
 int libfetch_open(struct pkg_repo *, struct fetch_item *);
