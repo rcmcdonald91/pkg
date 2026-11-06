@@ -120,7 +120,8 @@ _pkg_config_opts() {
 		'DEVELOPER_MODE[make certain errors immediately fatal, adds warnings and suggestions]:boolean:(yes no)' \
 		'DOT_FILE[save SAT problem to the specified dot file]:file:_files' \
 		'EVENT_PIPE[send all event messages to specified FIFO or UNIX socket]:event pipe:_files' \
-		'FETCH_RETRY[number of times to retry a failed fetch of a file]:number of retries' \
+		'FETCH_RETRY[maximum fetch attempts per server]:number of attempts' \
+		'FETCH_RETRY_DELAY[time to wait before retrying a failed fetch]:delay (seconds)' \
 		'FETCH_TIMEOUT[time to wait for a file to download]:timeout (seconds)' \
 		'HANDLE_RC_SCRIPTS[automatically perform start/stop of service on install/removal]:boolean:(yes no)' \
 		'HTTP_USER_AGENT[define User-agent HTTP header to send]:user agent' \

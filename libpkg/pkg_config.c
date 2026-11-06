@@ -179,7 +179,12 @@ static struct config_entry c[] = {
 	{
 		PKG_INT,
 		"FETCH_RETRY",
-		"3",
+		"5",
+	},
+	{
+		PKG_INT,
+		"FETCH_RETRY_DELAY",
+		"1",
 	},
 	{
 		PKG_STRING,

@@ -40,6 +40,8 @@
 #include <string.h>
 #include <paths.h>
 #include <poll.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <bsd_compat.h>
 
@@ -100,6 +102,38 @@ static struct fetcher fetchers[] = {
 		.fetch = stdio_fetch,
 	},
 };
+
+/*
+ * Delay before the given retry round (1 for the first one), doubled for
+ * each further failure. Cap before conversion, including large settings.
+ */
+unsigned int
+fetch_retry_delay(int64_t delay, int64_t attempt)
+{
+	if (delay <= 0 || attempt <= 0)
+		return (0);
+	while (--attempt > 0 && delay < FETCH_RETRY_DELAY_MAX)
+		delay *= 2;
+	if (delay > FETCH_RETRY_DELAY_MAX)
+		delay = FETCH_RETRY_DELAY_MAX;
+	return ((unsigned int)delay);
+}
+
+void
+fetch_retry_wait(int64_t attempt)
+{
+	struct timespec delay = {
+		.tv_sec = fetch_retry_delay(
+		    pkg_object_int(pkg_config_get("FETCH_RETRY_DELAY")), attempt),
+	};
+
+	if (delay.tv_sec == 0)
+		return;
+	pkg_dbg(PKG_DBG_FETCH, 1, "Fetch: waiting %jd seconds before retrying",
+	    (intmax_t)delay.tv_sec);
+	while (nanosleep(&delay, &delay) == -1 && errno == EINTR)
+		;
+}
 
 int
 pkg_fetch_file_tmp_limit(struct pkg_repo *repo, const char *url, char *dest,

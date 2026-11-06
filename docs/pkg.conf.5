@@ -217,18 +217,33 @@ Send all event messages to the specified FIFO or Unix socket.
 Events messages should be formatted as JSON.
 Default: not set.
 .It Cm FETCH_RETRY: integer
-Number of times to retry a failed fetch of a file against a given
-server before moving on to the next server.
+Maximum number of attempts to open a file on each server.
 For repositories configured with
 .Cm mirror_type
 .Cm srv
 or
 .Cm http ,
-each server in the list is tried this many times before advancing to
-the next one; the list is walked at most once.
-For a plain repository (a single server) this is the total number of
-retries before giving up.
-Default: 3.
+each server is tried once per pass through the list.
+Only after all servers fail does pkg wait and start another pass.
+No further pass is made when every server refused the request itself,
+for example with an authentication error or a malformed request, since
+waiting cannot change that.
+For a plain repository (a single server), each pass is one attempt.
+Set to 0 to make only the initial attempt, without retries or mirror
+failover; negative values are treated as 0.
+Default: 5.
+.It Cm FETCH_RETRY_DELAY: integer
+Number of seconds to wait before retrying a failed fetch, so that a
+short network outage does not use up
+.Cm FETCH_RETRY .
+The delay doubles with each further failed pass through the servers,
+up to 60 seconds.
+Moving on to the next server within a pass is not delayed.
+With the defaults, five failed passes incur waits of 1, 2, 4 and 8
+seconds (15 seconds total), regardless of the number of mirrors.
+Connection and transfer timeouts are additional to these waits.
+Set to 0 to retry immediately; negative values are treated as 0.
+Default: 1.
 .It Cm FETCH_TIMEOUT: integer
 Maximum number of seconds to wait for any one file to download from the
 network, either by SSH or any of the protocols supported by

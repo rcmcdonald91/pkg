@@ -27,6 +27,9 @@
 
 #pragma once
 
+/* Upper bound, in seconds, of the delay between two fetch attempts. */
+#define FETCH_RETRY_DELAY_MAX	60
+
 struct fetch_item {
 	const char *url;
 	off_t size;
@@ -50,6 +53,8 @@ int file_open(struct pkg_repo *, struct fetch_item *);
 void fh_close(struct pkg_repo *);
 int tcp_open(struct pkg_repo *, struct fetch_item *);
 int stdio_fetch(struct pkg_repo *, int dest, struct fetch_item *);
+unsigned int fetch_retry_delay(int64_t delay, int64_t attempt);
+void fetch_retry_wait(int64_t attempt);
 int libfetch_open(struct pkg_repo *, struct fetch_item *);
 int libfetch_fetch(struct pkg_repo *, int dest, struct fetch_item *);
 void libfetch_cleanup(struct pkg_repo *);

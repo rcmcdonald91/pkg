@@ -68,7 +68,8 @@ pkg_config_defaults_body()
 	    -o match:'^ *ABI = "[a-zA-Z0-9]+:[a-z\.A-Z0-9]+:[a-zA-Z0-9_]+";$'\
 	    -o match:'^ *DEVELOPER_MODE = false;$' \
 	    -o match:'^ *VULNXML_SITE = "https://vuxml.freebsd.org/freebsd/vuln.xml.xz";$' \
-	    -o match:'^ *FETCH_RETRY = 3;$' \
+	    -o match:'^ *FETCH_RETRY = 5;$' \
+	    -o match:'^ *FETCH_RETRY_DELAY = 1;$' \
 	    -o match:'^ *PKG_PLUGINS_DIR = ".*lib/pkg/";$' \
 	    -o match:'^ *PKG_ENABLE_PLUGINS = true;$' \
 	    -o match:'^ *DEBUG_SCRIPTS = false;$' \

@@ -164,12 +164,32 @@ pkg_repo_http_mirror_append(struct pkg_repo *repo, const char *url,
 	LL_APPEND(repo->http, m);
 }
 
-int
-libfetch_open(struct pkg_repo *repo, struct fetch_item *fi)
+/*
+ * The server refused the request itself (authentication, a malformed or
+ * unsupported request, a bad URL): asking it again later cannot help.
+ * Anything else, including errors libfetch does not classify, may be
+ * transient.
+ */
+static bool
+libfetch_permanent(void)
+{
+	switch (fetchLastErrCode) {
+	case FETCH_AUTH:
+	case FETCH_PROTO:
+	case FETCH_URL:
+		return (true);
+	default:
+		return (false);
+	}
+}
+
+static int
+libfetch_open_retry(struct pkg_repo *repo, struct fetch_item *fi,
+    int64_t max_retry)
 {
 	struct url *u;
 	struct url *repourl;
-	int64_t max_retry, retry;
+	int64_t retry;
 	int64_t fetch_timeout;
 	char docpath[MAXPATHLEN];
 	char zone[MAXHOSTNAMELEN + 24];
@@ -179,9 +199,9 @@ libfetch_open(struct pkg_repo *repo, struct fetch_item *fi)
 	struct url_stat st;
 	time_t ims;
 	int retcode;
+	bool transient = false;
 	sb_t fetchOpts = sb_init();
 
-	max_retry = pkg_object_int(pkg_config_get("FETCH_RETRY"));
 	if (max_retry < 0)
 		max_retry = 0;
 	fetch_timeout = pkg_object_int(pkg_config_get("FETCH_TIMEOUT"));
@@ -234,10 +254,11 @@ libfetch_open(struct pkg_repo *repo, struct fetch_item *fi)
 	 * HTTP mirror repositories it fetches the mirror list. A plain
 	 * repository has a single implicit server: the configured URL.
 	 *
-	 * Each server is given its own retry budget before we advance to the
-	 * next one, so a handful of unreachable servers no longer consumes
-	 * the whole budget meant for the list. The list is walked at most
-	 * once: once every server has been tried we give up.
+	 * Try every server once before waiting. Only a failed pass through
+	 * the whole list consumes a retry round, so a dead mirror does not
+	 * delay access to a healthy one. Backoff is shared by all mirrors:
+	 * adding mirrors does not multiply the time spent sleeping. A pass
+	 * in which every server refused the request itself is not retried.
 	 */
 	if (repo->mirror_type == SRV &&
 	    strncmp(u->scheme, "http", 4) == 0) {
@@ -342,18 +363,13 @@ libfetch_open(struct pkg_repo *repo, struct fetch_item *fi)
 				pkg_emit_pkg_errno(EPKG_NONETWORK,
 				    "libfetch_open", NULL);
 			}
-			--retry;
-			if (retry > 0)
-				continue;
+			if (!libfetch_permanent())
+				transient = true;
 			if (max_retry <= 0) {
 				/* No retry budget at all, no failover. */
 				break;
 			}
-			/*
-			 * This server's retry budget is exhausted; move on to the
-			 * next server in the list and give it a fresh budget.
-			 */
-			retry = max_retry;
+			/* Try the next mirror without a backoff delay. */
 			if (repo->mirror_type == SRV && srv_current != NULL) {
 				srv_current = srv_current->next;
 				if (srv_current != NULL)
@@ -364,8 +380,20 @@ libfetch_open(struct pkg_repo *repo, struct fetch_item *fi)
 				if (http_current != NULL)
 					continue;
 			}
-			/* No more servers to try. */
-			break;
+			/*
+			 * Waiting cannot cure a pass in which every server
+			 * refused the request outright; give up at once.
+			 */
+			if (!transient || --retry <= 0)
+				break;
+			transient = false;
+			fetch_retry_wait(max_retry - retry);
+			/* Start another pass, including the plain-URL fallback. */
+			if (repo->mirror_type == SRV)
+				srv_current = repo->srv;
+			else if (repo->mirror_type == HTTP)
+				http_current = repo->http;
+			continue;
 		}
 
 		/*
@@ -408,6 +436,13 @@ out:
 	u->doc = doc;
 	fetchFreeURL(u);
 	return (retcode);
+}
+
+int
+libfetch_open(struct pkg_repo *repo, struct fetch_item *fi)
+{
+	return (libfetch_open_retry(repo, fi,
+	    pkg_object_int(pkg_config_get("FETCH_RETRY"))));
 }
 
 int
